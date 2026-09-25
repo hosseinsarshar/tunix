@@ -768,6 +768,7 @@ class RLLearner(abc.ABC, Generic[TConfig]):
           max_segments_per_packed_row=getattr(
               self._training_config, "max_segments_per_packed_row", None
           ),
+          return_host_arrays=not mesh.empty,
       )
 
     curr_eval_ds = None
@@ -809,6 +810,20 @@ class RLLearner(abc.ABC, Generic[TConfig]):
               mode=rl_engine_lib.Mode.EVAL,
           )
           curr_eval_ds = eval_data_queue.get(block=True)
+        if (
+            self._training_config.max_seq_token_per_tpu is not None
+            and not hasattr(self.rl_engine, "critic_trainer")
+        ):
+          chained_train_ds = itertools.chain(
+              curr_train_ds,
+              (item for batch in train_data_gen for item in batch),
+          )
+          self.rl_engine.update_actor(
+              chained_train_ds,
+              curr_eval_ds,
+              skip_jit,
+          )
+          break
         self.rl_engine.update_actor(
             curr_train_ds,
             curr_eval_ds,

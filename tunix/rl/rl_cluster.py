@@ -477,9 +477,7 @@ class RLEngine:
     del self.rollout_actor
     del self.train_actor
     self._maybe_offload_model_to_cpu(self.actor_trainer.model, Role.ACTOR)
-    self._anchor_policy_state = rl_utils.put_params_on_memory_kind(
-        nnx.state(self.actor_trainer.model), "pinned_host"
-    )
+    self._anchor_policy_state = None
 
   def _propagate_backbone_sharing_map(self):
     """Propagates backbone sharing map."""
@@ -1130,9 +1128,8 @@ class RLEngine:
           "Cannot get actor log probabilities from an empty batch."
       )
     if self._anchor_policy_state is None:
-      raise ValueError(
-          "Anchor policy state is not initialized. Please run `sync_weights`"
-          " first."
+      self._anchor_policy_state = rl_utils.put_params_on_memory_kind(
+          nnx.state(self.actor_trainer.model), "pinned_host"
       )
     micro_batch_size = micro_batch_size or batch_size
     with self._get_mesh_and_logical_axis_rules_cm(Role.ACTOR) as (mesh, _):
@@ -1251,10 +1248,10 @@ class RLEngine:
       self.rollout.update_params(src_filtered_params, filter_types)
       if self.cluster_config.gc_collect_after_weight_sync:
         gc.collect()
-      # The anchor policy state is snapshotted from actor_trainer.model.
-      self._anchor_policy_state = rl_utils.put_params_on_memory_kind(
-          nnx.state(self.actor_trainer.model), "pinned_host"
-      )
+      # Invalidate anchor policy state; it is lazily snapshotted on demand in
+      # get_actor_per_token_logps if needed, avoiding an unconditional 808-tensor
+      # D2H transfer on every weight sync when use_rollout_logps=True.
+      self._anchor_policy_state = None
 
     # sync weights marks the end of a full batch, so increment the global steps.
     self.global_steps += 1

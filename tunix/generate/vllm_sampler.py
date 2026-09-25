@@ -304,6 +304,9 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
           reshard_chunk_size=self.config.reshard_chunk_size,
       )
 
+    # Mesh-based DP: sync rank 0's freshly updated weights onto ranks 1..N-1.
+    _meshdp_fanout_weights(self)
+
     if self.config.free_kv_cache_during_weight_sync:
       self.reinitialize_cache()
     else:
@@ -941,3 +944,93 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
             [len(row) for row in prompt_ids], dtype=np.int32
         ),
     )
+
+
+# --------------------------------------------------------------------------
+# Mesh-based DP weight fan-out (with cached dst_shardings across steps)
+# --------------------------------------------------------------------------
+
+
+def _meshdp_engine_core(sampler):
+  """The MeshDPEngineCore behind this sampler, or None if not on mesh DP."""
+  engine = None
+  if getattr(sampler, "llm", None) is not None:
+    engine = sampler.llm.llm_engine
+  elif getattr(sampler, "_driver", None) is not None:
+    engine = sampler._driver.llm_engine
+  if engine is None:
+    return None
+  core = getattr(engine, "engine_core", None)
+  core = getattr(core, "engine_core", core)
+  if core is None:
+    return None
+  if not (hasattr(core, "engines") and hasattr(core, "_broadcast")):
+    return None
+  if int(getattr(core, "dp_size", 1)) <= 1:
+    return None
+  return core
+
+
+def _meshdp_runner(engine):
+  return engine.model_executor.driver_worker.model_runner
+
+
+def _meshdp_refresh_state_leaves(runner):
+  if not hasattr(runner, "state_leaves"):
+    return
+  if isinstance(runner.state, dict):
+    runner.state_leaves = runner.state
+  else:
+    runner.state_leaves = tuple(jax.tree_util.tree_leaves(runner.state))
+
+
+def _meshdp_fanout_weights(sampler):
+  """Copy rank 0's freshly-synced weights onto ranks 1..N-1."""
+  core = _meshdp_engine_core(sampler)
+  if core is None:
+    return
+
+  engines = list(core.engines)
+  runners = [_meshdp_runner(e) for e in engines]
+  src_leaves, src_treedef = jax.tree_util.tree_flatten(runners[0].state)
+
+  cached = core.__dict__.get("_meshdp_cached_fanout_meta")
+  if cached is not None and cached[0] == src_treedef and len(cached[1]) == len(runners) - 1:
+    dst_shardings = cached[1]
+  else:
+    dst_shardings = []
+    for rank, runner in enumerate(runners[1:], start=1):
+      leaves, treedef = jax.tree_util.tree_flatten(runner.state)
+      if treedef != src_treedef:
+        raise RuntimeError(
+            f"Mesh-DP weight sync: rank {rank}'s state tree differs from rank 0's."
+        )
+      dst_shardings.append([leaf.sharding for leaf in leaves])
+    core.__dict__["_meshdp_cached_fanout_meta"] = (src_treedef, dst_shardings)
+
+  resharded = reshard.reshard_pytree(
+      [src_leaves] * len(dst_shardings),
+      dst_shardings,
+      donate_input=False,
+  )
+  jax.block_until_ready(resharded)
+
+  by_engine = {
+      id(e): leaves for e, leaves in zip(engines[1:], resharded)
+  }
+
+  def _install(engine):
+    leaves = by_engine.get(id(engine))
+    if leaves is None:
+      return
+    runner = _meshdp_runner(engine)
+    stale = jax.tree_util.tree_leaves(runner.state)
+    runner.state = jax.tree_util.tree_unflatten(src_treedef, list(leaves))
+    _meshdp_refresh_state_leaves(runner)
+    for arr in stale:
+      try:
+        arr.delete()
+      except Exception:
+        pass
+
+  core._broadcast(_install)

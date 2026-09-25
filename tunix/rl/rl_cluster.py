@@ -593,6 +593,19 @@ class RLEngine:
   def _log_metrics(self, metrics_buffer: MetricsBuffer) -> None:
     """Log metrics."""
     for metric_name, (value, op) in metrics_buffer.metrics.items():
+      if isinstance(value, (str, bytes)) or (
+          isinstance(value, (list, tuple))
+          and value
+          and (
+              isinstance(value[0], (str, bytes))
+              or (
+                  isinstance(value[0], (list, tuple))
+                  and value[0]
+                  and isinstance(value[0][0], (str, bytes))
+              )
+          )
+      ):
+        continue
       # Convert to numpy array immediately.
       # This handles nested lists, mixed types, and JAX arrays automatically.
       try:
@@ -604,11 +617,6 @@ class RLEngine:
         continue
 
       if agg_value.dtype.kind in {"U", "S"}:
-        logging.info(
-            "Rollout string metric %s: %s",
-            metric_name,
-            agg_value,
-        )
         continue
 
       if agg_value.dtype.kind == "O":
@@ -616,7 +624,6 @@ class RLEngine:
         if agg_value.size > 0 and isinstance(
             agg_value.ravel()[0], (str, np.str_)
         ):
-          logging.info("Rollout string metric %s: %s", metric_name, agg_value)
           continue
 
       # Apply aggregation and Log

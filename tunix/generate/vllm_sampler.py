@@ -523,13 +523,11 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
         # trainer-side concatenation miss `<|im_end|>` at every turn boundary
         # and produced 30+ nat sampler-trainer logp diffs.
 
-        out_tokens[idx].append(
-            np.array(single_output.token_ids, dtype=np.int32)
-        )
         if ready is not None:
-          text, logprobs = ready[idx]
+          text, logprobs, tok_arr = ready[idx]
         else:
-          text, logprobs = self._decode_single_output(single_output)
+          text, logprobs, tok_arr = self._decode_single_output(single_output)
+        out_tokens[idx].append(tok_arr)
         decoded_outputs[idx].append(text)
         out_logprobs[idx].append(logprobs)
         # `[length, num_layers, top_k]`, or None when capture is disabled.
@@ -545,17 +543,24 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
 
   def _decode_single_output(
       self, single_output: Any
-  ) -> Tuple[str, List[float] | None]:
-    """Text and per-token logprobs of one sampled completion."""
-    text = self.tokenizer.decode(single_output.token_ids)  # pyrefly: ignore[bad-argument-type]
-    logprobs = utils.get_logprobs_from_vllm_output(
-        list(single_output.token_ids), single_output.logprobs  # pyrefly: ignore[bad-argument-type]
+  ) -> Tuple[str, Any, np.ndarray]:
+    """Text, per-token logprobs, and token_ids array of one sampled completion."""
+    tok_ids = single_output.token_ids
+    text = self.tokenizer.decode(tok_ids)  # pyrefly: ignore[bad-argument-type]
+    logprobs_list = utils.get_logprobs_from_vllm_output(
+        tok_ids, single_output.logprobs  # pyrefly: ignore[bad-argument-type]
     )
-    return text, logprobs
+    logprobs = (
+        np.asarray(logprobs_list, dtype=np.float32)
+        if logprobs_list is not None
+        else None
+    )
+    tok_arr = np.asarray(tok_ids, dtype=np.int32)
+    return text, logprobs, tok_arr
 
   def _postprocess_request_output(
       self, request_output: RequestOutput
-  ) -> List[Tuple[str, List[float] | None]]:
+  ) -> List[Tuple[str, Any, np.ndarray]]:
     """Decodes every sample of a finished request (runs in the thread pool)."""
     return [self._decode_single_output(o) for o in request_output.outputs]
 
@@ -772,7 +777,14 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
         raise ValueError(
             "Provide exactly one of input_strings or prompt_token_ids"
         )
-      prompt_ids = [self.tokenize(x) for x in input_strings]
+      tok_cache: Dict[str, Any] = {}
+      prompt_ids = []
+      for x in input_strings:
+        ids = tok_cache.get(x)
+        if ids is None:
+          ids = self.tokenize(x)
+          tok_cache[x] = ids
+        prompt_ids.append(ids)
 
     # max_tokens: maximum number of tokens to generate
     if max_generation_steps > self.args["max_model_len"]:
@@ -875,7 +887,10 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       raise ValueError("prompt_token_ids requires exactly one output per row")
     prompt_objects = cast(
         List[TokensPrompt],
-        [{"prompt_token_ids": list(ids)} for ids in prompt_ids],
+        [
+            {"prompt_token_ids": ids if isinstance(ids, list) else list(ids)}
+            for ids in prompt_ids
+        ],
     )
     target_sampling_params: Union[
         SamplingParams, BeamSearchParams, List[SamplingParams]
@@ -915,20 +930,22 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
     ):
       raise ValueError("Logprobs are not returned from the vLLM.")
 
-    max_tokens_length = max(len(x) for x in prompt_ids)
+    prompt_lens = np.array([len(row) for row in prompt_ids], dtype=np.int32)
+    max_tokens_length = int(prompt_lens.max()) if len(prompt_lens) > 0 else 0
 
     if max_prompt_length is None or max_prompt_length < max_tokens_length:
       max_prompt_length = utils.next_power_of_2(max_tokens_length)
-    all_input_ids = [
-        utils.pad_to_length(
-            np.array(x, dtype=np.int32),
-            target_length=max_prompt_length,
-            pad_value=self.tokenizer.pad_id(),
-            left=True,
-        )
-        for x in prompt_ids
-    ]
-    all_input_ids = np.array(all_input_ids, dtype=np.int32)
+    pad_id = self.tokenizer.pad_id()
+    all_input_ids = np.full(
+        (len(prompt_ids), max_prompt_length), pad_id, dtype=np.int32
+    )
+    for idx_row, x in enumerate(prompt_ids):
+      n_tok = len(x)
+      if n_tok > 0:
+        if n_tok <= max_prompt_length:
+          all_input_ids[idx_row, max_prompt_length - n_tok :] = x
+        else:
+          all_input_ids[idx_row, :] = x[:max_prompt_length]
 
     # To support multisampling, just return the whole list of SamplerOutput
     return base_sampler.SamplerOutput(
@@ -940,9 +957,7 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
         routed_experts=(
             out_routed_experts[0] if self.config.return_routed_experts else None
         ),
-        prompt_lengths=np.array(
-            [len(row) for row in prompt_ids], dtype=np.int32
-        ),
+        prompt_lengths=prompt_lens,
     )
 
 

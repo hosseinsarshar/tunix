@@ -259,6 +259,12 @@ class RLLearner(abc.ABC, Generic[TConfig]):
 
     combined_batch = self._generate_and_compute_advantage(merged, mode)
 
+    if (
+        self._training_config.max_seq_token_per_tpu is not None
+        and self._data_shuffle_seed is None
+    ):
+      return [combined_batch]
+
     # Split back to original training micro size
     produced: list[common.TrainExample] = []
     offset = 0
@@ -352,6 +358,8 @@ class RLLearner(abc.ABC, Generic[TConfig]):
           shuffled_indices = jax.random.permutation(shuffle_seed, len(examples))
           for i in shuffled_indices:
             data_queue.put([examples[i]])
+        elif self._training_config.max_seq_token_per_tpu is not None:
+          data_queue.put(list(examples))
         else:
           for example in examples:
             data_queue.put([example])

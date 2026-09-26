@@ -29,6 +29,7 @@ from tunix.rl import algo_core  # pylint: disable=unused-import
 from tunix.rl import algorithm_config as algo_config_lib
 from tunix.rl import common
 from tunix.rl import function_registry
+from tunix.rl import packing
 from tunix.rl import rl_cluster as rl_engine_lib
 from tunix.rl import rl_learner
 from tunix.utils import compat
@@ -186,6 +187,7 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
         and self.algo_config.beta == 0.0
         and not needs_trainer_logps
     )
+    fast_pack_on_host = keep_on_host and rollout_output.routed_experts is None
     max_gen_len = rollout_config.max_tokens_to_generate
     num_seqs = len(rollout_output.tokens)
     token_dtype = (
@@ -193,41 +195,60 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
         if num_seqs > 0 and hasattr(rollout_output.tokens[0], "dtype")
         else np.int32
     )
-    padded_completion_ids = np.full(
-        (num_seqs, max_gen_len), pad_value, dtype=token_dtype
-    )
-    for idx, completion_ids in enumerate(rollout_output.tokens):
-      seq_len = min(len(completion_ids), max_gen_len)
-      if seq_len > 0:
-        padded_completion_ids[idx, :seq_len] = completion_ids[:seq_len]
     prompt_ids = (
         np.asarray(rollout_output.left_padded_prompt_tokens)
         if keep_on_host
         else jnp.array(rollout_output.left_padded_prompt_tokens)
     )
-    # Router replay: lay the rollout's routing out over the same
-    # `[prompt | completion]` padding the token ids just got, so a replayed
-    # expert stays attached to the token it was captured for.
-    routed_experts = common.align_routed_experts(
-        rollout_output.routed_experts,
-        completion_lengths=[len(t) for t in rollout_output.tokens],
-        prompt_width=prompt_ids.shape[-1],
-        completion_width=rollout_config.max_tokens_to_generate,
-    )
-
-    # Assemble masks
     prompt_mask = prompt_ids != pad_value
-    completion_mask = np.not_equal(padded_completion_ids, pad_value)
 
-    # Convert completion_ids and completion_mask to jax arrays only when needed on device
-    jax_completion_ids = (
-        padded_completion_ids
-        if keep_on_host
-        else jnp.array(padded_completion_ids)
-    )
-    jax_completion_mask = (
-        completion_mask if keep_on_host else jnp.array(completion_mask)
-    )
+    unpadded_c_ids: list[np.ndarray] = []
+    unpadded_c_masks: list[np.ndarray] = []
+    c_lens: list[int] = []
+    if fast_pack_on_host:
+      for completion_ids in rollout_output.tokens:
+        c_toks = np.asarray(completion_ids[:max_gen_len], dtype=np.int32)
+        c_len = int(np.count_nonzero(c_toks != pad_value))
+        if c_len == c_toks.shape[0]:
+          c_mask_1d = np.ones(c_len, dtype=np.float32)
+        else:
+          c_toks = c_toks[:c_len]
+          c_mask_1d = (c_toks != pad_value).astype(np.float32)
+        unpadded_c_ids.append(c_toks)
+        unpadded_c_masks.append(c_mask_1d)
+        c_lens.append(c_len)
+      routed_experts = None
+      jax_completion_ids = np.zeros((num_seqs, 0), dtype=token_dtype)
+      jax_completion_mask = np.zeros((num_seqs, 0), dtype=np.bool_)
+      agg_completion_mask = np.asarray(c_lens, dtype=np.int32)
+    else:
+      padded_completion_ids = np.full(
+          (num_seqs, max_gen_len), pad_value, dtype=token_dtype
+      )
+      for idx, completion_ids in enumerate(rollout_output.tokens):
+        seq_len = min(len(completion_ids), max_gen_len)
+        if seq_len > 0:
+          padded_completion_ids[idx, :seq_len] = completion_ids[:seq_len]
+      # Router replay: lay the rollout's routing out over the same
+      # `[prompt | completion]` padding the token ids just got, so a replayed
+      # expert stays attached to the token it was captured for.
+      routed_experts = common.align_routed_experts(
+          rollout_output.routed_experts,
+          completion_lengths=[len(t) for t in rollout_output.tokens],
+          prompt_width=prompt_ids.shape[-1],
+          completion_width=rollout_config.max_tokens_to_generate,
+      )
+      completion_mask = np.not_equal(padded_completion_ids, pad_value)
+      jax_completion_ids = (
+          padded_completion_ids
+          if keep_on_host
+          else jnp.array(padded_completion_ids)
+      )
+      jax_completion_mask = (
+          completion_mask if keep_on_host else jnp.array(completion_mask)
+      )
+      agg_completion_mask = completion_mask.sum(axis=-1)
+
     compute_logps_micro_batch_size = (
         self._compute_logps_micro_batch_size * self.algo_config.num_generations
         if self._compute_logps_micro_batch_size
@@ -260,6 +281,7 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
     if (
         self.algo_config.use_rollout_logps
         and rollout_output.logprobs is not None
+        and not fast_pack_on_host
     ):
       logp_dtype = (
           rollout_output.logprobs[0].dtype
@@ -301,7 +323,15 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
         and trainer_per_token_logps is not None
     ):
       old_per_token_logps = trainer_per_token_logps
-    if self.algo_config.num_iterations > 1 and old_per_token_logps is None:
+    if (
+        self.algo_config.num_iterations > 1
+        and old_per_token_logps is None
+        and not (
+            fast_pack_on_host
+            and self.algo_config.use_rollout_logps
+            and rollout_output.logprobs is not None
+        )
+    ):
       raise RuntimeError(
           "old_per_token_logps is not available for off-policy RL. Enable "
           "`return_logprobs` in RolloutConfig."
@@ -337,7 +367,6 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
     )
 
     # Log completion lengths.
-    agg_completion_mask = completion_mask.sum(axis=-1)
     self.rl_engine.buffer_metrics(
         {
             "completions/mean_length": (
@@ -442,6 +471,51 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
       )
       self.rl_engine.buffer_metrics(user_defined_metric, mode=mode)
 
+    pack_items = None
+    if fast_pack_on_host:
+      p_lens = np.sum(prompt_mask, axis=1).tolist()
+      adv_np = np.asarray(advantages, dtype=np.float32)
+      adv_is_per_token = adv_np.ndim == 2
+      raw_logps = (
+          rollout_output.logprobs
+          if (
+              self.algo_config.use_rollout_logps
+              and rollout_output.logprobs is not None
+          )
+          else None
+      )
+      p_ids_int32 = np.asarray(prompt_ids, dtype=np.int32)
+      pack_items = [
+          packing.PackItem(
+              prompt_ids=(
+                  p_ids_int32[i, -p_lens[i] :]
+                  if p_lens[i] > 0
+                  else p_ids_int32[i, :0]
+              ),
+              completion_ids=unpadded_c_ids[i],
+              completion_mask=unpadded_c_masks[i],
+              advantages=(
+                  adv_np[i, : c_lens[i]]
+                  if adv_is_per_token
+                  else np.full(
+                      c_lens[i],
+                      float(adv_np.reshape(-1)[i]),
+                      dtype=np.float32,
+                  )
+              ),
+              per_token=(
+                  {
+                      "old_per_token_logps": np.asarray(
+                          raw_logps[i][: c_lens[i]], dtype=np.float32
+                      )
+                  }
+                  if raw_logps is not None
+                  else {}
+              ),
+          )
+          for i in range(num_seqs)
+      ]
+
     return TrainExample(
         prompt_ids=prompt_ids,
         prompt_mask=prompt_mask,
@@ -460,6 +534,7 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
                 else jax.device_put(routed_experts)
             )
         ),
+        pack_items=pack_items,
     )
 
   def _compute_trajectory_ids(

@@ -130,6 +130,9 @@ class TrainExample:
   # When set, a model that accepts `forced_routed_experts` replays these
   # instead of re-running its router. `-1` marks a slot to leave to the router.
   routed_experts: ArrayType | None = None
+  pack_items: Sequence[Any] | None = flax.struct.field(
+      default=None, pytree_node=False
+  )
 
   def to_jax_array(self) -> "TrainExample":
     """Returns a copy of the batch with all array fields moved to JAX array."""

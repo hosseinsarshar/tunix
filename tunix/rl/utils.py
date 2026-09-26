@@ -167,9 +167,15 @@ def get_batch_slice(tree: Any, batch_slice: slice) -> Any:
     else:
       return x
 
-  return jax.tree_util.tree_map(
+  sliced = jax.tree_util.tree_map(
       apply_slice, tree, is_leaf=lambda node: node is None
   )
+  if (
+      isinstance(sliced, common.TrainExample)
+      and getattr(tree, "pack_items", None) is not None
+  ):
+    sliced = sliced.replace(pack_items=tree.pack_items[batch_slice])
+  return sliced
 
 
 def merge_micro_batches(batches: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -451,6 +457,9 @@ def train_example_to_pack_items(
     example: common.TrainExample,
 ) -> list[packing.PackItem]:
   """Converts a TrainExample to a list of PackItems."""
+  prebuilt = getattr(example, "pack_items", None)
+  if prebuilt is not None:
+    return list(prebuilt)
   items = [
       packing.PackItem(
           prompt_ids=np.asarray(item["prompt_ids"], dtype=np.int32),
@@ -587,26 +596,62 @@ def pack_sequences(
   example_cls: type[Any] = common.TrainExample
   mask_dtype: Any = jnp.float32
   first_item_for_dummy: packing.PackItem | None = None
+  arr_fn = np.asarray if return_host_arrays else jnp.asarray
+  zeros_fn = np.zeros if return_host_arrays else jnp.zeros
+  concat_fn = np.concatenate if return_host_arrays else jnp.concatenate
 
   def _emit_chunk(bins, is_update):
-    """Packs one chunk's bins and conver them to a TrainExample."""
+    """Packs one chunk's bins and converts them to a TrainExample."""
     real = [it for b in bins for it in b]
     if first_item_for_dummy is not None:
       real = real + [first_item_for_dummy]
     carried = packing.carried_per_token_fields(real)
-    rows = packing.pack_chunk(
-        bins, budget=max_token_budget, pad_id=pad_id, carried=carried
+    n = len(bins)
+    (
+        ids,
+        comp_mask,
+        advantages,
+        segment_ids,
+        segment_positions,
+        per_token,
+        versions,
+    ) = packing.pack_bins_to_2d_arrays(
+        bins,
+        budget=max_token_budget,
+        pad_id=pad_id,
+        carried=carried,
+        mask_dtype=mask_dtype,
     )
-    return [
-        pack_rows_to_train_examples(
-            rows,
-            example_cls,
-            mask_dtype=mask_dtype,
-            num_segments=num_segments,
-            is_update_step=is_update,
-            return_host_arrays=return_host_arrays,
+    kwargs: dict[str, Any] = dict(
+        prompt_ids=zeros_fn((n, 0), dtype=np.int32),
+        prompt_mask=zeros_fn((n, 0), dtype=mask_dtype),
+        completion_ids=arr_fn(ids),
+        completion_mask=arr_fn(comp_mask),
+        advantages=arr_fn(advantages),
+        segment_ids=arr_fn(segment_ids),
+        segment_positions=arr_fn(segment_positions),
+        ref_per_token_logps=None,
+        old_per_token_logps=None,
+    )
+    for name, arr in per_token.items():
+      kwargs[name] = arr_fn(arr)
+    if any(v is not None for v in versions):
+      fallback = next(v for v in versions if v is not None)
+      kwargs["policy_version"] = concat_fn([
+          arr_fn(v if v is not None else fallback).reshape(-1)
+          for v in versions
+      ])
+    example = example_cls(**kwargs)
+    replacements: dict[str, Any] = {
+        "is_update_step": (
+            np.array([is_update], dtype=np.bool_)
+            if return_host_arrays
+            else jnp.array([is_update], dtype=jnp.bool_)
         )
-    ]
+    }
+    if hasattr(example, "num_segments"):
+      replacements["num_segments"] = num_segments
+    return [example.replace(**replacements)]
 
   def _take_chunk():
     nonlocal buffered, chunks_in_mini

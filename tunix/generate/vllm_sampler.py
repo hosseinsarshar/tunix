@@ -262,10 +262,13 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
   ):
     del filter_types
 
+    meshdp_core = _meshdp_engine_core(self)
     if self.config.free_kv_cache_during_weight_sync:
       self.delete_cache()
-    else:
+    elif meshdp_core is None:
       # Keep the KV pool allocated; only its (stale) prefix entries go.
+      # On Mesh-DP, reset_prefix_cache is fused into _meshdp_fanout_weights
+      # below so we only do a single 64-rank _broadcast instead of two.
       self.reset_prefix_cache()
 
     # Synchronization point before weight sync
@@ -304,12 +307,16 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
           reshard_chunk_size=self.config.reshard_chunk_size,
       )
 
-    # Mesh-based DP: sync rank 0's freshly updated weights onto ranks 1..N-1.
-    _meshdp_fanout_weights(self)
+    # Mesh-based DP: sync rank 0's freshly updated weights onto ranks 1..N-1
+    # (and fuse prefix-cache reset + state_leaves refresh into the same broadcast).
+    _meshdp_fanout_weights(
+        self,
+        reset_prefix_cache=not self.config.free_kv_cache_during_weight_sync,
+    )
 
     if self.config.free_kv_cache_during_weight_sync:
       self.reinitialize_cache()
-    else:
+    elif meshdp_core is None:
       self.refresh_state_leaves()
 
   def _is_torchax_backend(self) -> bool:
@@ -619,14 +626,18 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
     self._postprocessed = None
     engine = self.llm.llm_engine  # pyrefly: ignore[missing-attribute]
     counter = self.llm.request_counter  # pyrefly: ignore[missing-attribute]
-    for idx, prompt in enumerate(prompts):
-      params = (
-          sampling_params[idx]
-          if isinstance(sampling_params, list)
-          else sampling_params
-      )
-      params.output_kind = RequestOutputKind.FINAL_ONLY
-      engine.add_request(str(next(counter)), prompt, params)
+    if isinstance(sampling_params, list):
+      for idx, prompt in enumerate(prompts):
+        params = sampling_params[idx]
+        params.output_kind = RequestOutputKind.FINAL_ONLY
+        engine.add_request(str(next(counter)), prompt, params)
+    else:
+      sampling_params.output_kind = RequestOutputKind.FINAL_ONLY
+      for prompt in prompts:
+        engine.add_request(str(next(counter)), prompt, sampling_params)
+    core = _meshdp_engine_core(self)
+    if core is not None and hasattr(core, "flush_batch_submission"):
+      core.flush_batch_submission()
     outputs: List[RequestOutput] = []
     futures: Dict[str, concurrent.futures.Future[Any]] = {}
     progress = tqdm.tqdm(
@@ -885,13 +896,17 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       # One sampled row per submitted row, no truncation: the echo check and
       # the recorded history assume the engine consumed exactly these ids.
       raise ValueError("prompt_token_ids requires exactly one output per row")
-    prompt_objects = cast(
-        List[TokensPrompt],
-        [
-            {"prompt_token_ids": ids if isinstance(ids, list) else list(ids)}
-            for ids in prompt_ids
-        ],
-    )
+    prompt_obj_cache: Dict[int, TokensPrompt] = {}
+    prompt_objects: List[TokensPrompt] = []
+    for ids in prompt_ids:
+      obj = prompt_obj_cache.get(id(ids))
+      if obj is None:
+        obj = cast(
+            TokensPrompt,
+            {"prompt_token_ids": ids if isinstance(ids, list) else list(ids)},
+        )
+        prompt_obj_cache[id(ids)] = obj
+      prompt_objects.append(obj)
     target_sampling_params: Union[
         SamplingParams, BeamSearchParams, List[SamplingParams]
     ] = sampling_params
@@ -939,13 +954,19 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
     all_input_ids = np.full(
         (len(prompt_ids), max_prompt_length), pad_id, dtype=np.int32
     )
+    padded_row_cache: Dict[int, np.ndarray] = {}
     for idx_row, x in enumerate(prompt_ids):
+      cached_row = padded_row_cache.get(id(x))
+      if cached_row is not None:
+        all_input_ids[idx_row] = cached_row
+        continue
       n_tok = len(x)
       if n_tok > 0:
         if n_tok <= max_prompt_length:
           all_input_ids[idx_row, max_prompt_length - n_tok :] = x
         else:
           all_input_ids[idx_row, :] = x[:max_prompt_length]
+      padded_row_cache[id(x)] = all_input_ids[idx_row]
 
     # To support multisampling, just return the whole list of SamplerOutput
     return base_sampler.SamplerOutput(
@@ -999,7 +1020,7 @@ def _meshdp_refresh_state_leaves(runner):
     runner.state_leaves = tuple(jax.tree_util.tree_leaves(runner.state))
 
 
-def _meshdp_fanout_weights(sampler):
+def _meshdp_fanout_weights(sampler, reset_prefix_cache: bool = False):
   """Copy rank 0's freshly-synced weights onto ranks 1..N-1."""
   core = _meshdp_engine_core(sampler)
   if core is None:
@@ -1008,6 +1029,11 @@ def _meshdp_fanout_weights(sampler):
   engines = list(core.engines)
   runners = [_meshdp_runner(e) for e in engines]
   src_leaves, src_treedef = jax.tree_util.tree_flatten(runners[0].state)
+  if hasattr(runners[0], "state_leaves"):
+    if isinstance(runners[0].state, dict):
+      runners[0].state_leaves = runners[0].state
+    else:
+      runners[0].state_leaves = tuple(src_leaves)
 
   cached = core.__dict__.get("_meshdp_cached_fanout_meta")
   if cached is not None and cached[0] == src_treedef and len(cached[1]) == len(runners) - 1:
@@ -1035,13 +1061,24 @@ def _meshdp_fanout_weights(sampler):
   }
 
   def _install(engine):
+    if reset_prefix_cache:
+      engine.reset_prefix_cache(False, False)
     leaves = by_engine.get(id(engine))
     if leaves is None:
       return
     runner = _meshdp_runner(engine)
-    stale = jax.tree_util.tree_leaves(runner.state)
-    runner.state = jax.tree_util.tree_unflatten(src_treedef, list(leaves))
-    _meshdp_refresh_state_leaves(runner)
+    prev_leaves = getattr(runner, "state_leaves", None)
+    if isinstance(prev_leaves, (tuple, list)):
+      stale = prev_leaves
+    else:
+      stale = jax.tree_util.tree_leaves(runner.state)
+    leaves_tuple = tuple(leaves)
+    runner.state = jax.tree_util.tree_unflatten(src_treedef, leaves_tuple)
+    if hasattr(runner, "state_leaves"):
+      if isinstance(runner.state, dict):
+        runner.state_leaves = runner.state
+      else:
+        runner.state_leaves = leaves_tuple
     for arr in stale:
       try:
         arr.delete()

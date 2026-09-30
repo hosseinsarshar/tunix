@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -115,6 +115,16 @@ def carried_per_token_fields(items: Sequence[PackItem]) -> tuple[str, ...]:
   return tuple(carried)
 
 
+_ARANGE_BUF: np.ndarray = np.arange(16384, dtype=np.int32)
+
+
+def _get_arange(n: int) -> np.ndarray:
+  global _ARANGE_BUF
+  if n > _ARANGE_BUF.shape[0]:
+    _ARANGE_BUF = np.arange(max(n, _ARANGE_BUF.shape[0] * 2), dtype=np.int32)
+  return _ARANGE_BUF[:n]
+
+
 def fill_one_chunk(
     items: Sequence[PackItem],
     *,
@@ -143,20 +153,22 @@ def fill_one_chunk(
   """
   bins: list[list[PackItem]] = [[] for _ in range(pack_size)]
   loads = [0] * pack_size
-  order = sorted(
-      range(len(items)), key=lambda i: items[i].num_tokens, reverse=True
-  )
-  placed_flags = [False] * len(items)
+  num_items = len(items)
+  item_lens = [
+      it.prompt_ids.shape[0] + it.completion_ids.shape[0] for it in items
+  ]
+  order = sorted(range(num_items), key=item_lens.__getitem__, reverse=True)
+  placed_flags = [False] * num_items
   for i in order:
     item = items[i]
-    n = item.num_tokens
+    n = item_lens[i]
     for b in range(pack_size):
       if loads[b] + n <= budget and len(bins[b]) < max_segments:
         bins[b].append(item)
         loads[b] += n
         placed_flags[i] = True
         break
-  leftover = [items[i] for i in range(len(items)) if not placed_flags[i]]
+  leftover = [items[i] for i in range(num_items) if not placed_flags[i]]
   return bins, leftover
 
 
@@ -173,7 +185,11 @@ def pack_bin(
 
   if not bin_items:
     return PackedRow(
-        ids=np.full(budget, pad_id, dtype=np.int32),
+        ids=(
+            np.zeros(budget, dtype=np.int32)
+            if pad_id == 0
+            else np.full(budget, pad_id, dtype=np.int32)
+        ),
         prompt_mask=zeros_f(),
         completion_mask=zeros_f(),
         advantages=zeros_f(),
@@ -188,32 +204,38 @@ def pack_bin(
   if total > budget:
     raise ValueError(f"pack_bin: bin size {total} exceeds budget {budget}.")
 
-  ids = np.full(budget, pad_id, dtype=np.int32)
+  ids = (
+      np.zeros(budget, dtype=np.int32)
+      if pad_id == 0
+      else np.full(budget, pad_id, dtype=np.int32)
+  )
   prompt_mask = zeros_f()
   completion_mask = zeros_f()
   advantages = zeros_f()
   segment_ids = zeros_i()
   segment_positions = zeros_i()
   per_token = {name: zeros_f() for name in carried}
+  arange_buf = _get_arange(budget)
 
   cursor = 0
   for seg, item in enumerate(bin_items, start=1):
     p = item.prompt_ids.shape[0]
     c = item.completion_ids.shape[0]
     n = p + c
-    seq = slice(cursor, cursor + n)
-    comp = slice(cursor + p, cursor + n)
+    c_start = cursor + p
+    c_end = cursor + n
 
-    ids[seq] = np.concatenate([item.prompt_ids, item.completion_ids])
-    prompt_mask[cursor : cursor + p] = 1.0
-    segment_ids[seq] = seg
-    segment_positions[seq] = np.arange(n, dtype=np.int32)
+    ids[cursor:c_start] = item.prompt_ids
+    ids[c_start:c_end] = item.completion_ids
+    prompt_mask[cursor:c_start] = 1.0
+    segment_ids[cursor:c_end] = seg
+    segment_positions[cursor:c_end] = arange_buf[:n]
 
-    completion_mask[comp] = item.completion_mask
-    advantages[comp] = item.advantages
+    completion_mask[c_start:c_end] = item.completion_mask
+    advantages[c_start:c_end] = item.advantages
     for name in carried:
-      per_token[name][comp] = item.per_token[name]
-    cursor += n
+      per_token[name][c_start:c_end] = item.per_token[name]
+    cursor = c_end
 
   return PackedRow(
       ids=ids,
@@ -240,6 +262,74 @@ def pack_chunk(
       pack_bin(bin_items, budget=budget, pad_id=pad_id, carried=carried)
       for bin_items in bins
   ]
+
+
+def pack_bins_to_2d_arrays(
+    bins: Sequence[Sequence[PackItem]],
+    *,
+    budget: int,
+    pad_id: int,
+    carried: Sequence[str],
+    mask_dtype: np.dtype | type[Any] = np.float32,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict[str, np.ndarray],
+    list[np.ndarray | None],
+]:
+  """Packs bins directly into pre-allocated 2D `[len(bins), budget]` arrays."""
+  n_bins = len(bins)
+  shape = (n_bins, budget)
+  ids = (
+      np.zeros(shape, dtype=np.int32)
+      if pad_id == 0
+      else np.full(shape, pad_id, dtype=np.int32)
+  )
+  completion_mask = np.zeros(shape, dtype=mask_dtype)
+  advantages = np.zeros(shape, dtype=np.float32)
+  segment_ids = np.zeros(shape, dtype=np.int32)
+  segment_positions = np.zeros(shape, dtype=np.int32)
+  per_token = {name: np.zeros(shape, dtype=np.float32) for name in carried}
+  versions: list[np.ndarray | None] = [None] * n_bins
+  arange_buf = _get_arange(budget)
+
+  for b, bin_items in enumerate(bins):
+    if not bin_items:
+      continue
+    versions[b] = bin_items[0].policy_version
+    cursor = 0
+    for seg, item in enumerate(bin_items, start=1):
+      p = item.prompt_ids.shape[0]
+      c = item.completion_ids.shape[0]
+      n = p + c
+      c_start = cursor + p
+      c_end = cursor + n
+      if c_end > budget:
+        raise ValueError(
+            f"pack_bins_to_2d_arrays: bin size {c_end} exceeds budget {budget}."
+        )
+      ids[b, cursor:c_start] = item.prompt_ids
+      ids[b, c_start:c_end] = item.completion_ids
+      segment_ids[b, cursor:c_end] = seg
+      segment_positions[b, cursor:c_end] = arange_buf[:n]
+      completion_mask[b, c_start:c_end] = item.completion_mask
+      advantages[b, c_start:c_end] = item.advantages
+      for name in carried:
+        per_token[name][b, c_start:c_end] = item.per_token[name]
+      cursor = c_end
+
+  return (
+      ids,
+      completion_mask,
+      advantages,
+      segment_ids,
+      segment_positions,
+      per_token,
+      versions,
+  )
 
 
 def effective_max_segments(

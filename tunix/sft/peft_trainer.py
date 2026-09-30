@@ -801,6 +801,10 @@ class PeftTrainer:
     self._buffered_train_metrics = None
 
   def _write_metrics(self, metrics_buffer: MetricsBuffer):
+    metrics_buffer.losses, metrics_buffer.additional_metrics = jax.device_get(
+        (metrics_buffer.losses, metrics_buffer.additional_metrics)
+    )
+
     def _to_np_array(v):
       if isinstance(v, jax.Array):
         return np.asarray(v, dtype=np.float32)
@@ -938,6 +942,19 @@ class PeftTrainer:
           break
 
         train_example = self._prepare_inputs(train_example)
+        is_update_step_val = None
+        if (
+            isinstance(train_example, dict)
+            and "is_update_step" in train_example
+        ):
+          val = train_example["is_update_step"]
+          if val is not None:
+            is_update_step_val = bool(np.asarray(val).item())
+        elif hasattr(train_example, "is_update_step"):
+          val = train_example.is_update_step
+          if val is not None:
+            is_update_step_val = bool(np.asarray(val).item())
+
         train_example = sharding_utils.shard_input(
             train_example, self.config.data_sharding_axis
         )
@@ -973,19 +990,6 @@ class PeftTrainer:
         }
 
         self._iter_steps += 1
-
-        is_update_step_val = None
-        if (
-            isinstance(train_example, dict)
-            and "is_update_step" in train_example
-        ):
-          val = train_example["is_update_step"]
-          if val is not None:
-            is_update_step_val = bool(np.asarray(val).item())
-        elif hasattr(train_example, "is_update_step"):
-          val = train_example.is_update_step
-          if val is not None:
-            is_update_step_val = bool(np.asarray(val).item())
 
         if is_update_step_val is None:
           is_update_step_val = (

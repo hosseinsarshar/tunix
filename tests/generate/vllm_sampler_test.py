@@ -673,7 +673,7 @@ class VllmSamplerConfigTest(absltest.TestCase):
     self.assertEqual([o.request_id for o in outputs], ["0", "1"])
     texts, logprobs, tokens, _ = sampler.detokenize(["a", "b"], outputs)
     self.assertEqual(texts, [["t01", "t12"]])
-    self.assertEqual(logprobs, [[[], []]])
+    np.testing.assert_equal(logprobs, [[[], []]])
     self.assertEqual([t.tolist() for t in tokens[0]], [[0, 1], [1, 2]])
     # Each finished request was decoded once, in the pool, not in detokenize.
     self.assertEqual(sampler.tokenizer.decode.call_count, 2)
@@ -719,7 +719,7 @@ class VllmSamplerConfigTest(absltest.TestCase):
     texts, logprobs, tokens, _ = sampler.detokenize(["a"], [output])
 
     self.assertEqual(texts, [["text"]])
-    self.assertEqual(logprobs, [[[]]])
+    np.testing.assert_equal(logprobs, [[[]]])
     self.assertEqual([t.tolist() for t in tokens[0]], [[4, 5]])
     sampler.tokenizer.decode.assert_called_once_with([4, 5])
 
@@ -756,7 +756,7 @@ class VllmSamplerConfigTest(absltest.TestCase):
     self.assertEqual([o.request_id for o in outputs], ["0", "1"])
     texts, logprobs, _, _ = sampler.detokenize(["a", "b"], outputs)
     self.assertEqual(texts, [["t01", "t12"]])
-    self.assertEqual(logprobs, [[[], []]])
+    np.testing.assert_equal(logprobs, [[[], []]])
     self.assertEqual(sampler.tokenizer.decode.call_count, 2)
 
   def test_postprocessing_threads_must_be_positive(self):

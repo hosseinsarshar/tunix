@@ -507,7 +507,7 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       self, input_strings: List[str], request_outputs: List[RequestOutput]
   ) -> Tuple[
       List[List[str]],
-      List[List[List[float] | None]],
+      List[List[np.ndarray | None]],
       List[List[np.ndarray]],
       List[List[np.ndarray | None]],
   ]:
@@ -532,13 +532,11 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
         # trainer-side concatenation miss `<|im_end|>` at every turn boundary
         # and produced 30+ nat sampler-trainer logp diffs.
 
-        out_tokens[idx].append(
-            np.array(single_output.token_ids, dtype=np.int32)
-        )
         if ready is not None:
-          text, logprobs = ready[idx]
+          text, logprobs, tok_arr = ready[idx]
         else:
-          text, logprobs = self._decode_single_output(single_output)
+          text, logprobs, tok_arr = self._decode_single_output(single_output)
+        out_tokens[idx].append(tok_arr)
         decoded_outputs[idx].append(text)
         out_logprobs[idx].append(logprobs)
         # `[length, num_layers, top_k]`, or None when capture is disabled.
@@ -554,17 +552,24 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
 
   def _decode_single_output(
       self, single_output: Any
-  ) -> Tuple[str, List[float] | None]:
-    """Text and per-token logprobs of one sampled completion."""
-    text = self.tokenizer.decode(single_output.token_ids)  # pyrefly: ignore[bad-argument-type]
-    logprobs = utils.get_logprobs_from_vllm_output(
-        list(single_output.token_ids), single_output.logprobs  # pyrefly: ignore[bad-argument-type]
+  ) -> Tuple[str, np.ndarray | None, np.ndarray]:
+    """Text, per-token logprobs and token ids of one sampled completion."""
+    tok_ids = single_output.token_ids
+    text = self.tokenizer.decode(tok_ids)  # pyrefly: ignore[bad-argument-type]
+    logprobs_list = utils.get_logprobs_from_vllm_output(
+        tok_ids, single_output.logprobs  # pyrefly: ignore[bad-argument-type]
     )
-    return text, logprobs
+    logprobs = (
+        np.asarray(logprobs_list, dtype=np.float32)
+        if logprobs_list is not None
+        else None
+    )
+    tok_arr = np.asarray(tok_ids, dtype=np.int32)
+    return text, logprobs, tok_arr
 
   def _postprocess_request_output(
       self, request_output: RequestOutput
-  ) -> List[Tuple[str, List[float] | None]]:
+  ) -> List[Tuple[str, np.ndarray | None, np.ndarray]]:
     """Decodes every sample of a finished request (runs in the thread pool)."""
     return [self._decode_single_output(o) for o in request_output.outputs]
 
@@ -623,14 +628,15 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
     self._postprocessed = None
     engine = self.llm.llm_engine  # pyrefly: ignore[missing-attribute]
     counter = self.llm.request_counter  # pyrefly: ignore[missing-attribute]
-    for idx, prompt in enumerate(prompts):
-      params = (
-          sampling_params[idx]
-          if isinstance(sampling_params, list)
-          else sampling_params
-      )
-      params.output_kind = RequestOutputKind.FINAL_ONLY
-      engine.add_request(str(next(counter)), prompt, params)
+    if isinstance(sampling_params, list):
+      for idx, prompt in enumerate(prompts):
+        params = sampling_params[idx]
+        params.output_kind = RequestOutputKind.FINAL_ONLY
+        engine.add_request(str(next(counter)), prompt, params)
+    else:
+      sampling_params.output_kind = RequestOutputKind.FINAL_ONLY
+      for prompt in prompts:
+        engine.add_request(str(next(counter)), prompt, sampling_params)
     outputs: List[RequestOutput] = []
     futures: Dict[str, concurrent.futures.Future[Any]] = {}
     progress = tqdm.tqdm(
@@ -852,10 +858,17 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       # One sampled row per submitted row, no truncation: the echo check and
       # the recorded history assume the engine consumed exactly these ids.
       raise ValueError("prompt_token_ids requires exactly one output per row")
-    prompt_objects = cast(
-        List[TokensPrompt],
-        [{"prompt_token_ids": list(ids)} for ids in prompt_ids],
-    )
+    prompt_obj_cache: Dict[int, TokensPrompt] = {}
+    prompt_objects: List[TokensPrompt] = []
+    for ids in prompt_ids:
+      obj = prompt_obj_cache.get(id(ids))
+      if obj is None:
+        obj = cast(
+            TokensPrompt,
+            {"prompt_token_ids": ids if isinstance(ids, list) else list(ids)},
+        )
+        prompt_obj_cache[id(ids)] = obj
+      prompt_objects.append(obj)
     target_sampling_params: Union[
         SamplingParams, BeamSearchParams, List[SamplingParams]
     ] = sampling_params

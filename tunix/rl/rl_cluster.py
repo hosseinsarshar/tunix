@@ -512,9 +512,7 @@ class RLEngine:
     del self.rollout_actor
     del self.train_actor
     self._maybe_offload_model_to_cpu(self.actor_trainer.model, Role.ACTOR)
-    self._anchor_policy_state = rl_utils.put_params_on_memory_kind(
-        nnx.state(self.actor_trainer.model), "pinned_host"
-    )
+    self._anchor_policy_state = None
 
   def _propagate_backbone_sharing_map(self):
     """Propagates backbone sharing map."""
@@ -631,6 +629,20 @@ class RLEngine:
   def _log_metrics(self, metrics_buffer: MetricsBuffer) -> None:
     """Log metrics."""
     for metric_name, (value, op) in metrics_buffer.metrics.items():
+      # Skip string metrics (e.g. completions) before the numpy conversion.
+      if isinstance(value, (str, bytes)) or (
+          isinstance(value, (list, tuple))
+          and value
+          and (
+              isinstance(value[0], (str, bytes))
+              or (
+                  isinstance(value[0], (list, tuple))
+                  and value[0]
+                  and isinstance(value[0][0], (str, bytes))
+              )
+          )
+      ):
+        continue
       # Convert to numpy array immediately.
       # This handles nested lists, mixed types, and JAX arrays automatically.
       try:
@@ -642,11 +654,6 @@ class RLEngine:
         continue
 
       if agg_value.dtype.kind in {"U", "S"}:
-        logging.info(
-            "Rollout string metric %s: %s",
-            metric_name,
-            agg_value,
-        )
         continue
 
       if agg_value.dtype.kind == "O":
@@ -654,7 +661,6 @@ class RLEngine:
         if agg_value.size > 0 and isinstance(
             agg_value.ravel()[0], (str, np.str_)
         ):
-          logging.info("Rollout string metric %s: %s", metric_name, agg_value)
           continue
 
       # Apply aggregation and Log
@@ -1173,9 +1179,8 @@ class RLEngine:
           "Cannot get actor log probabilities from an empty batch."
       )
     if self._anchor_policy_state is None:
-      raise ValueError(
-          "Anchor policy state is not initialized. Please run `sync_weights`"
-          " first."
+      self._anchor_policy_state = rl_utils.put_params_on_memory_kind(
+          nnx.state(self.actor_trainer.model), "pinned_host"
       )
     micro_batch_size = micro_batch_size or batch_size
     with self._get_mesh_and_logical_axis_rules_cm(Role.ACTOR) as (mesh, _):
@@ -1294,10 +1299,9 @@ class RLEngine:
       self.rollout.update_params(src_filtered_params, filter_types)
       if self.cluster_config.gc_collect_after_weight_sync:
         gc.collect()
-      # The anchor policy state is snapshotted from actor_trainer.model.
-      self._anchor_policy_state = rl_utils.put_params_on_memory_kind(
-          nnx.state(self.actor_trainer.model), "pinned_host"
-      )
+      # Snapshotted lazily in get_actor_per_token_logps, so runs that never
+      # call it skip a full-model device-to-host copy on every sync.
+      self._anchor_policy_state = None
 
     # sync weights marks the end of a full batch, so increment the global steps.
     self.global_steps += 1

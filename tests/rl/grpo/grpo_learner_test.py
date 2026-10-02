@@ -150,6 +150,7 @@ class GRPOLearnerTest(parameterized.TestCase):
         self._last_iter_step = 0
         self.algo_config = grpo_config
         self._data_shuffle_seed = None
+        self._packing_enabled = False
         self.rl_engine = types.SimpleNamespace(  # pyrefly: ignore[bad-assignment]
             global_steps=0,
             cluster_config=types.SimpleNamespace(

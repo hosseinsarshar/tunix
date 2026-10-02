@@ -167,9 +167,15 @@ def get_batch_slice(tree: Any, batch_slice: slice) -> Any:
     else:
       return x
 
-  return jax.tree_util.tree_map(
+  sliced = jax.tree_util.tree_map(
       apply_slice, tree, is_leaf=lambda node: node is None
   )
+  if (
+      isinstance(sliced, common.TrainExample)
+      and getattr(tree, "pack_items", None) is not None
+  ):
+    sliced = sliced.replace(pack_items=tree.pack_items[batch_slice])
+  return sliced
 
 
 def merge_micro_batches(batches: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -371,11 +377,13 @@ def unpad_train_example(example: common.TrainExample) -> list[dict[str, Any]]:
   if has_policy_version:
     policy_version_np = np.asarray(policy_version_val)
 
+  p_lens = np.sum(p_mask, axis=1).tolist()
+  c_lens = np.sum(
+      c_mask if completion_valid is None else completion_valid, axis=1
+  ).tolist()
   for i in range(batch_size):
-    p_len = int(np.sum(p_mask[i]))
-    c_len = int(
-        np.sum(c_mask[i] if completion_valid is None else completion_valid[i])
-    )
+    p_len = int(p_lens[i])
+    c_len = int(c_lens[i])
 
     # `policy_version` is per-row: row `i` of the input maps to scalar
     # `policy_version_np[i]`. We slice with `i:i+1` to keep a 1-D shape so that
@@ -449,6 +457,9 @@ def train_example_to_pack_items(
     example: common.TrainExample,
 ) -> list[packing.PackItem]:
   """Converts a TrainExample to a list of PackItems."""
+  prebuilt = getattr(example, "pack_items", None)
+  if prebuilt is not None:
+    return list(prebuilt)
   items = [
       packing.PackItem(
           prompt_ids=np.asarray(item["prompt_ids"], dtype=np.int32),
@@ -486,32 +497,39 @@ def pack_rows_to_train_examples(
     mask_dtype: Any,
     num_segments: int,
     is_update_step: bool,
+    return_host_arrays: bool = False,
 ) -> Any:
   """Converts a PackedChunk to a TrainExample."""
   n = len(chunk)
+  arr_fn = np.asarray if return_host_arrays else jnp.asarray
+  zeros_fn = np.zeros if return_host_arrays else jnp.zeros
+  concat_fn = np.concatenate if return_host_arrays else jnp.concatenate
   kwargs: dict[str, Any] = dict(
-      prompt_ids=jnp.zeros((n, 0), dtype=np.int32),
-      prompt_mask=jnp.zeros((n, 0), dtype=mask_dtype),
-      completion_ids=jnp.asarray(chunk.ids),
-      completion_mask=jnp.asarray(chunk.completion_mask, dtype=mask_dtype),
-      advantages=jnp.asarray(chunk.advantages),
-      segment_ids=jnp.asarray(chunk.segment_ids),
-      segment_positions=jnp.asarray(chunk.segment_positions),
+      prompt_ids=zeros_fn((n, 0), dtype=np.int32),
+      prompt_mask=zeros_fn((n, 0), dtype=mask_dtype),
+      completion_ids=arr_fn(chunk.ids),
+      completion_mask=arr_fn(chunk.completion_mask, dtype=mask_dtype),
+      advantages=arr_fn(chunk.advantages),
+      segment_ids=arr_fn(chunk.segment_ids),
+      segment_positions=arr_fn(chunk.segment_positions),
       ref_per_token_logps=None,
       old_per_token_logps=None,
   )
   for name, val in chunk.per_token.items():
-    kwargs[name] = jnp.asarray(val)
+    kwargs[name] = arr_fn(val)
   versions = chunk.policy_versions
   if any(v is not None for v in versions):
     fallback = next(v for v in versions if v is not None)
-    kwargs["policy_version"] = jnp.concatenate([
-        jnp.asarray(v if v is not None else fallback).reshape(-1)
-        for v in versions
-    ])
+    kwargs["policy_version"] = concat_fn(
+        [arr_fn(v if v is not None else fallback).reshape(-1) for v in versions]
+    )
   example = example_cls(**kwargs)
   replacements: dict[str, Any] = {
-      "is_update_step": jnp.array([is_update_step], dtype=jnp.bool_)
+      "is_update_step": (
+          np.array([is_update_step], dtype=np.bool_)
+          if return_host_arrays
+          else jnp.array([is_update_step], dtype=jnp.bool_)
+      )
   }
   if hasattr(example, "num_segments"):
     replacements["num_segments"] = num_segments
@@ -525,6 +543,7 @@ def pack_sequences(
     pad_id: int = 0,
     pack_size: int = 1,
     max_segments_per_packed_row: int | None = None,
+    return_host_arrays: bool = False,
 ) -> Iterator[list[common.TrainExample]]:
   """FFD-packs sequences into [pack_size, max_token_budget] chunks, streaming.
 
@@ -545,6 +564,9 @@ def pack_sequences(
     pad_id: Padding vocabulary id.
     pack_size: Rows per chunk (= fsdp * dp); each chunk is [pack_size,
       max_token_budget].
+    max_segments_per_packed_row: Optional cap on segments per packed row.
+    return_host_arrays: Keep chunk arrays on host, so the trainer shards them
+      straight onto its mesh.
 
   Yields:
     Single-element lists, each one [pack_size, max_token_budget] TrainExample.
@@ -586,6 +608,7 @@ def pack_sequences(
             mask_dtype=mask_dtype,
             num_segments=num_segments,
             is_update_step=is_update,
+            return_host_arrays=return_host_arrays,
         )
     ]
 

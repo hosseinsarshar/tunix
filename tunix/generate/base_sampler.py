@@ -45,7 +45,7 @@ class SamplerOutput:
   # Left padded prompt tokens.
   padded_prompt_tokens: np.ndarray
 
-  logprobs: Optional[list[list[float]]]
+  logprobs: Optional[list[list[float] | np.ndarray]]
 
   # Per-generation MoE routing decisions, each `[length, num_layers, top_k]`.
   # None unless the backend was asked to capture them. Used to replay the

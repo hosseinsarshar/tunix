@@ -2189,7 +2189,16 @@ def resolve_prompt_tokens(
     input_strings = [input_strings]
   if len(input_strings) == 0:
     raise ValueError('input_strings must not be empty')
-  return [np.asarray(tokenize_fn(str(x)), dtype=np.int32) for x in input_strings]
+  tok_cache: Dict[str, np.ndarray] = {}
+  prompt_ids: list[np.ndarray] = []
+  for x in input_strings:
+    s = str(x)
+    ids = tok_cache.get(s)
+    if ids is None:
+      ids = np.asarray(tokenize_fn(s), dtype=np.int32)
+      tok_cache[s] = ids
+    prompt_ids.append(ids)
+  return prompt_ids
 
 
 def left_pad_prompt_tokens(
@@ -2209,18 +2218,22 @@ def left_pad_prompt_tokens(
         and max_tokens_length <= max_allowed_length
     ):
       max_prompt_length = min(max_prompt_length, max_allowed_length)
-  all_input_ids = np.array(
-      [
-          pad_to_length(
-              np.asarray(x, dtype=np.int32),
-              target_length=max_prompt_length,
-              pad_value=pad_value,
-              left=True,
-          )
-          for x in prompt_ids
-      ],
-      dtype=np.int32,
+  all_input_ids = np.full(
+      (len(prompt_ids), max_prompt_length), pad_value, dtype=np.int32
   )
+  padded_row_cache: Dict[int, np.ndarray] = {}
+  for idx_row, x in enumerate(prompt_ids):
+    cached_row = padded_row_cache.get(id(x))
+    if cached_row is not None:
+      all_input_ids[idx_row] = cached_row
+      continue
+    n_tok = len(x)
+    if n_tok > 0:
+      if n_tok <= max_prompt_length:
+        all_input_ids[idx_row, max_prompt_length - n_tok :] = x
+      else:
+        all_input_ids[idx_row, :] = x[:max_prompt_length]
+    padded_row_cache[id(x)] = all_input_ids[idx_row]
   return all_input_ids, prompt_lengths, max_prompt_length
 
 

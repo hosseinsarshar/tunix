@@ -2589,6 +2589,60 @@ class TokenIdsTest(parameterized.TestCase):
     np.testing.assert_array_equal(tokens[0], [1, 2, 3])
     np.testing.assert_array_equal(tokens[1], [4, 5, 6])
 
+  def test_resolve_prompt_tokens_tokenizes_each_unique_string_once(self):
+    calls = []
+
+    def fake_tokenize(s: str):
+      calls.append(s)
+      return [ord(c) for c in s]
+
+    prompts = ["ab", "cde", "ab", "ab", "cde"]
+    tokens = utils.resolve_prompt_tokens(prompts, None, fake_tokenize)
+    self.assertEqual(calls, ["ab", "cde"])
+    self.assertLen(tokens, len(prompts))
+    for row, prompt in zip(tokens, prompts):
+      np.testing.assert_array_equal(row, [ord(c) for c in prompt])
+      self.assertEqual(row.dtype, np.int32)
+    self.assertIs(tokens[0], tokens[2])
+    self.assertIs(tokens[1], tokens[4])
+
+  @parameterized.named_parameters(
+      dict(testcase_name="shared_rows", shared=True),
+      dict(testcase_name="distinct_rows", shared=False),
+  )
+  def test_left_pad_prompt_tokens(self, shared):
+    row_a = np.array([5, 6, 7], dtype=np.int32)
+    row_b = np.array([8], dtype=np.int32)
+    empty = np.zeros(0, dtype=np.int32)
+    rows = [row_a, row_b, row_a, empty, row_a]
+    if not shared:
+      rows = [row.copy() for row in rows]
+    padded, lengths, max_len = utils.left_pad_prompt_tokens(rows, None, -1)
+    self.assertEqual(max_len, 4)
+    self.assertEqual(padded.dtype, np.int32)
+    np.testing.assert_array_equal(lengths, [3, 1, 3, 0, 3])
+    np.testing.assert_array_equal(
+        padded,
+        [
+            [-1, 5, 6, 7],
+            [-1, -1, -1, 8],
+            [-1, 5, 6, 7],
+            [-1, -1, -1, -1],
+            [-1, 5, 6, 7],
+        ],
+    )
+
+  def test_left_pad_prompt_tokens_accepts_2d_arrays_and_lists(self):
+    # Iterating a 2-D array yields a new row view every time.
+    rows = np.arange(1, 13, dtype=np.int32).reshape(6, 2)
+    padded, _, max_len = utils.left_pad_prompt_tokens(rows, 3, 0)
+    self.assertEqual(max_len, 3)
+    np.testing.assert_array_equal(padded[:, 1:], rows)
+    np.testing.assert_array_equal(padded[:, 0], 0)
+    padded, lengths, _ = utils.left_pad_prompt_tokens([[1, 2], [3]], 2, 0)
+    np.testing.assert_array_equal(padded, [[1, 2], [0, 3]])
+    np.testing.assert_array_equal(lengths, [2, 1])
+
 
 if __name__ == "__main__":
   absltest.main()

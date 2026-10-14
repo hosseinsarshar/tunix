@@ -512,7 +512,6 @@ class RLEngine:
     del self.rollout_actor
     del self.train_actor
     self._maybe_offload_model_to_cpu(self.actor_trainer.model, Role.ACTOR)
-    self._anchor_policy_state = None
 
   def _propagate_backbone_sharing_map(self):
     """Propagates backbone sharing map."""
@@ -1179,6 +1178,10 @@ class RLEngine:
           "Cannot get actor log probabilities from an empty batch."
       )
     if self._anchor_policy_state is None:
+      # First call of the run. Callers compute old log-probs before they train
+      # on a batch, so the actor still holds the weights of the last sync (or
+      # of init), which is what an eager snapshot would have captured. From
+      # now on `sync_weights` refreshes the snapshot.
       self._anchor_policy_state = rl_utils.put_params_on_memory_kind(
           nnx.state(self.actor_trainer.model), "pinned_host"
       )
@@ -1299,9 +1302,16 @@ class RLEngine:
       self.rollout.update_params(src_filtered_params, filter_types)
       if self.cluster_config.gc_collect_after_weight_sync:
         gc.collect()
-      # Snapshotted lazily in get_actor_per_token_logps, so runs that never
-      # call it skip a full-model device-to-host copy on every sync.
-      self._anchor_policy_state = None
+      # The anchor policy state is snapshotted from actor_trainer.model. Runs
+      # that never call get_actor_per_token_logps (e.g. rollout logps with
+      # beta=0) skip this full-model copy to pinned host memory. Once it is in
+      # use, refresh it here and not lazily: a later snapshot could already
+      # include training updates, e.g. when an agentic producer with
+      # off_policy_steps > 0 computes log-probs while the trainer trains.
+      if self._anchor_policy_state is not None:
+        self._anchor_policy_state = rl_utils.put_params_on_memory_kind(
+            nnx.state(self.actor_trainer.model), "pinned_host"
+        )
 
     # sync weights marks the end of a full batch, so increment the global steps.
     self.global_steps += 1

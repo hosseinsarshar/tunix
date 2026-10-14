@@ -384,6 +384,116 @@ class RlEngineTest(parameterized.TestCase):
       rl_engine.sync_weights()
     self.assertEqual(mock_collect.called, gc_collect_after_weight_sync)
 
+  def _create_anchor_test_engine(self) -> rl_engine_lib.RLEngine:
+    mesh = Mesh(np.array(jax.devices()).reshape(-1, 1), ('fsdp', 'tp'))
+    cluster_config = rl_engine_lib.ClusterConfig(
+        role_to_mesh={
+            rl_engine_lib.Role.ACTOR: mesh,
+            rl_engine_lib.Role.REFERENCE: mesh,
+            rl_engine_lib.Role.ROLLOUT: mesh,
+        },
+        rollout_engine='vanilla',
+        offload_to_cpu=False,
+        training_config=rl_engine_lib.RLTrainingConfig(
+            actor_optimizer=optax.sgd(1e-3),
+            eval_every_n_steps=1,
+            max_steps=10,
+            gradient_accumulation_steps=None,
+        ),
+        rollout_config=base_rollout.RolloutConfig(
+            max_tokens_to_generate=10,
+            max_prompt_length=256,
+            kv_cache_size=1024,
+        ),
+    )
+    vocab = tc.MockVocab()
+    model = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()), rngs=nnx.Rngs(0)
+    )
+    return rl_engine_lib.RLEngine(
+        actor=model, tokenizer=vocab, cluster_config=cluster_config
+    )
+
+  def _actor_logps(self, rl_engine):
+    return np.asarray(
+        rl_engine.get_actor_per_token_logps(
+            prompt_tokens=jnp.array(
+                [[3, 4, 5], [5, 6, 7], [7, 8, 9], [9, 10, 11]], dtype=jnp.int32
+            ),
+            completion_tokens=jnp.array(
+                [[12, 13, 2], [14, 15, 2], [16, 17, 2], [18, 19, 2]],
+                dtype=jnp.int32,
+            ),
+            pad_id=0,
+            eos_id=2,
+        )
+    )
+
+  def _train_actor(self, rl_engine, seed):
+    """Stands in for an optimizer step on the actor."""
+    model = rl_engine.actor_trainer.model
+    leaves, treedef = jax.tree.flatten(nnx.state(model, nnx.Param))
+    keys = jax.random.split(jax.random.key(seed), len(leaves))
+    nnx.update(
+        model,
+        jax.tree.unflatten(
+            treedef,
+            [
+                x + 0.1 * jax.random.normal(k, x.shape, x.dtype)
+                for x, k in zip(leaves, keys)
+            ],
+        ),
+    )
+
+  def _fresh_actor_logps(self, rl_engine):
+    """Log-probs of the actor's current weights (forces a new snapshot)."""
+    rl_engine._anchor_policy_state = None
+    return self._actor_logps(rl_engine)
+
+  def test_anchor_policy_state_is_not_copied_until_used(self):
+    rl_engine = self._create_anchor_test_engine()
+    self.assertIsNone(rl_engine._anchor_policy_state)
+    with mock.patch.object(
+        rl_engine_lib.rl_utils,
+        'put_params_on_memory_kind',
+        wraps=rl_engine_lib.rl_utils.put_params_on_memory_kind,
+    ) as put:
+      rl_engine.sync_weights()
+      rl_engine.sync_weights()
+    memory_kinds = [
+        c.args[1] if len(c.args) > 1 else c.kwargs.get('memory_kind')
+        for c in put.call_args_list
+    ]
+    self.assertNotIn('pinned_host', memory_kinds)
+    self.assertIsNone(rl_engine._anchor_policy_state)
+
+  def test_anchor_policy_state_is_taken_on_first_use(self):
+    rl_engine = self._create_anchor_test_engine()
+    initial = self._actor_logps(rl_engine)
+    self.assertIsNotNone(rl_engine._anchor_policy_state)
+    # Later calls before the next sync keep using the first snapshot.
+    self._train_actor(rl_engine, seed=1)
+    np.testing.assert_array_equal(self._actor_logps(rl_engine), initial)
+    self.assertFalse(np.allclose(self._fresh_actor_logps(rl_engine), initial))
+
+  def test_anchor_policy_state_is_the_policy_at_the_last_sync(self):
+    rl_engine = self._create_anchor_test_engine()
+    model = rl_engine.actor_trainer.model
+    self._actor_logps(rl_engine)
+    self._train_actor(rl_engine, seed=1)
+    synced = jax.tree.map(jnp.copy, nnx.state(model, nnx.Param))
+    rl_engine.sync_weights()
+    # The trainer moves on before the next log-prob call, as with an agentic
+    # producer that runs ahead (off_policy_steps > 0).
+    self._train_actor(rl_engine, seed=2)
+    after_sync = self._actor_logps(rl_engine)
+    trained = self._fresh_actor_logps(rl_engine)
+    nnx.update(model, synced)
+    np.testing.assert_array_equal(
+        after_sync, self._fresh_actor_logps(rl_engine)
+    )
+    self.assertFalse(np.allclose(after_sync, trained))
+
   def test_init_engine_invalid_engine_string(self):
     with self.assertRaisesRegex(
         ValueError, '`cluster_config.rollout_engine` should be one of'

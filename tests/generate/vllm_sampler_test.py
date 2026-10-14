@@ -1021,6 +1021,29 @@ class VllmSamplerTokenInputTest(absltest.TestCase):
     obj.tokenizer.encode.assert_called_once_with("ordinary text")
     np.testing.assert_array_equal(out.prompt_lengths, [3])
 
+  def test_repeated_prompts_share_one_python_int_prompt(self):
+    obj = self._sampler()
+    obj.tokenizer.encode.side_effect = lambda s: [4, len(s)]
+    out = obj(["ab", "cde", "ab"], 4)
+    self.assertEqual(obj.tokenizer.encode.call_count, 2)
+    prompts = obj.llm.generate.call_args.kwargs["prompts"]
+    self.assertEqual(
+        prompts,
+        [
+            {"prompt_token_ids": [4, 2]},
+            {"prompt_token_ids": [4, 3]},
+            {"prompt_token_ids": [4, 2]},
+        ],
+    )
+    self.assertIs(prompts[0], prompts[2])
+    # Plain ints, not np.int32: they pickle much faster in the engine.
+    for prompt in prompts:
+      for token in prompt["prompt_token_ids"]:
+        self.assertIsInstance(token, int)
+    np.testing.assert_array_equal(
+        out.padded_prompt_tokens, [[4, 2], [4, 3], [4, 2]]
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

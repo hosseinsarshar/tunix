@@ -858,15 +858,17 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       # One sampled row per submitted row, no truncation: the echo check and
       # the recorded history assume the engine consumed exactly these ids.
       raise ValueError("prompt_token_ids requires exactly one output per row")
+    # `resolve_prompt_tokens` returns one array per unique prompt string, so
+    # the samples of a repeated prompt share one TokensPrompt. `tolist()` gives
+    # plain Python ints: a list of np.int32 scalars pickles about 20x slower
+    # when the engine ships requests to worker processes (e.g. tpu-inference's
+    # DP scheduler, about 1 s per RL step for 2,048 prompts).
     prompt_obj_cache: Dict[int, TokensPrompt] = {}
     prompt_objects: List[TokensPrompt] = []
     for ids in prompt_ids:
       obj = prompt_obj_cache.get(id(ids))
       if obj is None:
-        obj = cast(
-            TokensPrompt,
-            {"prompt_token_ids": ids if isinstance(ids, list) else list(ids)},
-        )
+        obj = cast(TokensPrompt, {"prompt_token_ids": ids.tolist()})
         prompt_obj_cache[id(ids)] = obj
       prompt_objects.append(obj)
     target_sampling_params: Union[

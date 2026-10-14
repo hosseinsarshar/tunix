@@ -494,6 +494,29 @@ class RlEngineTest(parameterized.TestCase):
     )
     self.assertFalse(np.allclose(after_sync, trained))
 
+  def test_log_metrics_keeps_string_metric_logs(self):
+    engine = mock.Mock(_external_metrics_logger=None)
+    buffer = rl_engine_lib.MetricsBuffer(global_steps=3, mode='train')
+    completions = [['a', 'bb'], ['ccc', 'd']]
+    buffer.metrics['completions'] = (completions, None)
+    buffer.metrics['ragged'] = ([['a'], ['b', 'c']], None)
+    buffer.metrics['rewards/sum'] = ([1.0, 3.0], np.mean)
+    with mock.patch.object(
+        rl_engine_lib.logging, 'info'
+    ) as info, mock.patch.object(rl_engine_lib.logging, 'warning') as warning:
+      rl_engine_lib.RLEngine._log_metrics(engine, buffer)
+    info.assert_called_once()
+    _, name, logged = info.call_args.args
+    self.assertEqual(name, 'completions')
+    # Same text as the fixed-width array, without building one.
+    self.assertEqual(logged.dtype, object)
+    self.assertEqual(str(logged), str(np.array(completions)))
+    warning.assert_called_once()
+    self.assertEqual(warning.call_args.args[1], 'ragged')
+    engine._rl_metrics_logger.log.assert_called_once_with(
+        'rewards', 'sum', 2.0, 'train', 3
+    )
+
   def test_init_engine_invalid_engine_string(self):
     with self.assertRaisesRegex(
         ValueError, '`cluster_config.rollout_engine` should be one of'

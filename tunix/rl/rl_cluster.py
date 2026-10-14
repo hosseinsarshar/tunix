@@ -99,6 +99,13 @@ def _profile_scope(
     profiler.maybe_deactivate(role_str, future_output=scope.future_output)
 
 
+def _is_string_metric(value: Any) -> bool:
+  """Whether the first leaf of a buffered (nested list) metric is a string."""
+  while isinstance(value, (list, tuple)) and value:
+    value = value[0]
+  return isinstance(value, (str, bytes))
+
+
 class RLEngine:
   """RLEngine."""
 
@@ -628,20 +635,16 @@ class RLEngine:
   def _log_metrics(self, metrics_buffer: MetricsBuffer) -> None:
     """Log metrics."""
     for metric_name, (value, op) in metrics_buffer.metrics.items():
-      # Skip string metrics (e.g. completions) before the numpy conversion.
-      if isinstance(value, (str, bytes)) or (
-          isinstance(value, (list, tuple))
-          and value
-          and (
-              isinstance(value[0], (str, bytes))
-              or (
-                  isinstance(value[0], (list, tuple))
-                  and value[0]
-                  and isinstance(value[0][0], (str, bytes))
-              )
-          )
-      ):
-        continue
+      if _is_string_metric(value):
+        # Strings (e.g. prompts and completions) are only logged. An object
+        # array prints the same text as the fixed-width unicode array below,
+        # without first copying every string into it (about 260 MB and 0.1 s
+        # per step for 2,048 completions of up to 8K tokens). Ragged values
+        # fall through and fail the conversion below, as before.
+        text_value = np.array(value, dtype=object)
+        if not isinstance(text_value.flat[0], (list, tuple)):
+          logging.info("Rollout string metric %s: %s", metric_name, text_value)
+          continue
       # Convert to numpy array immediately.
       # This handles nested lists, mixed types, and JAX arrays automatically.
       try:
@@ -653,6 +656,11 @@ class RLEngine:
         continue
 
       if agg_value.dtype.kind in {"U", "S"}:
+        logging.info(
+            "Rollout string metric %s: %s",
+            metric_name,
+            agg_value,
+        )
         continue
 
       if agg_value.dtype.kind == "O":
@@ -660,6 +668,7 @@ class RLEngine:
         if agg_value.size > 0 and isinstance(
             agg_value.ravel()[0], (str, np.str_)
         ):
+          logging.info("Rollout string metric %s: %s", metric_name, agg_value)
           continue
 
       # Apply aggregation and Log
